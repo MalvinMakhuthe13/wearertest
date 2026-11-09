@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Wig Try-On Prototype</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: system-ui, sans-serif; }
+  #stage { position: relative; width: 100vw; height: 100vh; }
+  video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+  #ui { position: absolute; left: 0; right: 0; bottom: 0; padding: 10px 12px; background: rgba(0,0,0,.6); color: #fff; display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px 14px; z-index: 5; }
+  #ui label { font-size: 12px; display: flex; flex-direction: column; gap: 3px; }
+  #ui input { width: 100%; }
+  #status { position: absolute; top: 10px; left: 10px; right: 10px; color: #fff; background: rgba(0,0,0,.6); padding: 8px 12px; border-radius: 8px; font-size: 14px; z-index: 5; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="gl"></canvas>
+  <div id="status">Loading face tracking...</div>
+  <div id="ui">
+    <label>Colour <input type="color" id="colour" value="#1a1210"></label>
+    <label>Hair length <input type="range" id="length" min="0.5" max="3" step="0.05" value="1.6"></label>
+    <label>Sway <input type="range" id="sway" min="0.05" max="0.6" step="0.01" value="0.25"></label>
+    <label>Wig size <input type="range" id="size" min="0.8" max="2.5" step="0.05" value="1.5"></label>
+    <label>Wig height <input type="range" id="height" min="-0.3" max="0.8" step="0.02" value="0.3"></label>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"
+} }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
+
+const video = document.getElementById('video');
+const canvas = document.getElementById('gl');
+const statusEl = document.getElementById('status');
+const colourEl = document.getElementById('colour');
+const lengthEl = document.getElementById('length');
+const swayEl = document.getElementById('sway');
+const sizeEl = document.getElementById('size');
+const heightEl = document.getElementById('height');
+
+// ---------- Three.js scene ----------
+const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 100);
+scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+const key = new THREE.DirectionalLight(0xffffff, 0.8);
+key.position.set(0.5, 1, 1);
+scene.add(key);
+
+// ---------- Procedural wig ----------
+const STRANDS = 110;
+const JOINTS = 9;
+const wig = new THREE.Group();
+scene.add(wig);
+
+const capMat = new THREE.MeshStandardMaterial({ color: 0x1a1210, roughness: 0.8 });
+const cap = new THREE.Mesh(new THREE.SphereGeometry(0.5, 32, 24, 0, Math.PI * 2, 0, Math.PI * 0.62), capMat);
+wig.add(cap);
+
+// Strands start on the sides and back of the head only, so hair never covers the face
+const strands = [];
+for (let i = 0; i < STRANDS; i++) {
+  const angle = 1.5 * Math.PI + (i / (STRANDS - 1) - 0.5) * 1.44 * Math.PI;
+  const ring = 0.46 + Math.random() * 0.06;
+  const root = new THREE.Vector3(Math.cos(angle) * ring, Math.random() * 0.12, Math.sin(angle) * ring);
+  const joints = [];
+  for (let j = 0; j < JOINTS; j++) joints.push({ pos: new THREE.Vector3(), vel: new THREE.Vector3() });
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(JOINTS * 3), 3));
+  const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0x1a1210 }));
+  line.frustumCulled = false;
+  scene.add(line);
+  strands.push({ root, joints, line, ready: false });
+}
+
+// ---------- Face tracking ----------
+let landmarker;
+async function setup() {
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 1280, height: 720 }, audio: false });
+  video.srcObject = stream;
+  await video.play();
+
+  const fileset = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+  const make = delegate => FaceLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task', delegate },
+    runningMode: 'VIDEO', numFaces: 1, outputFacialTransformationMatrixes: true
+  });
+  try { landmarker = await make('GPU'); } catch (e) { landmarker = await make('CPU'); }
+  statusEl.textContent = 'Look at the camera';
+  requestAnimationFrame(loop);
+}
+
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+// ---------- Main loop ----------
+const headMatrix = new THREE.Matrix4();
+const headPos = new THREE.Vector3();
+const headQuat = new THREE.Quaternion();
+const headScale = new THREE.Vector3();
+const tmp = new THREE.Vector3();
+let lastTime = performance.now();
+let lastVideoTime = -1;
+let faceFound = false;
+
+function loop(now) {
+  requestAnimationFrame(loop);
+  const dt = Math.min((now - lastTime) / 1000, 0.05);
+  lastTime = now;
+
+  if (video.currentTime !== lastVideoTime && video.readyState >= 2) {
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, now);
+    if (res.facialTransformationMatrixes && res.facialTransformationMatrixes.length) {
+      headMatrix.fromArray(res.facialTransformationMatrixes[0].data);
+      headMatrix.decompose(headPos, headQuat, headScale);
+      // MediaPipe reports centimetres; 1 scene unit = 10 cm
+      wig.position.copy(headPos).multiplyScalar(0.1);
+      wig.quaternion.copy(headQuat);
+      wig.scale.setScalar(parseFloat(sizeEl.value));
+      cap.position.set(0, parseFloat(heightEl.value), -0.02);
+      faceFound = true;
+      statusEl.style.display = 'none';
+    } else {
+      faceFound = false;
+      statusEl.style.display = 'block';
+      statusEl.textContent = 'No face found. Find good light and face the camera.';
+    }
+  }
+  wig.visible = faceFound;
+  updateHair(dt);
+  renderer.render(scene, camera);
+}
+
+// ---------- Hair physics: chained springs that lag behind the head ----------
+const gravity = new THREE.Vector3(0, -6, 0);
+const rootLocal = new THREE.Vector3();
+function updateHair(dt) {
+  const length = parseFloat(lengthEl.value);
+  const stiffness = 1 - parseFloat(swayEl.value);
+  const segLen = (length * 1.5) / JOINTS;
+  const offset = parseFloat(heightEl.value);
+  const col = new THREE.Color(colourEl.value);
+  capMat.color.copy(col);
+
+  for (const st of strands) {
+    st.line.visible = faceFound;
+    if (!faceFound) { st.ready = false; continue; }
+
+    rootLocal.copy(st.root);
+    rootLocal.y += offset;
+    rootLocal.multiplyScalar(wig.scale.x).applyQuaternion(wig.quaternion).add(wig.position);
+
+    // first frame after the face appears: hang the strand straight down from its root
+    if (!st.ready) {
+      for (let j = 0; j < JOINTS; j++) {
+        st.joints[j].pos.copy(rootLocal).y -= j * segLen;
+        st.joints[j].vel.set(0, 0, 0);
+      }
+      st.ready = true;
+    }
+
+    st.joints[0].pos.copy(rootLocal);
+    st.joints[0].vel.set(0, 0, 0);
+
+    for (let j = 1; j < JOINTS; j++) {
+      const p = st.joints[j], prev = st.joints[j - 1];
+      p.vel.addScaledVector(gravity, dt);
+      p.vel.multiplyScalar(0.92);
+      p.pos.addScaledVector(p.vel, dt);
+
+      tmp.copy(p.pos).sub(prev.pos);
+      const dist = tmp.length() || 0.0001;
+      tmp.multiplyScalar(segLen / dist).add(prev.pos);
+      p.pos.lerp(tmp, 0.5 + stiffness * 0.5);
+    }
+
+    const arr = st.line.geometry.attributes.position.array;
+    for (let j = 0; j < JOINTS; j++) {
+      arr[j * 3] = st.joints[j].pos.x;
+      arr[j * 3 + 1] = st.joints[j].pos.y;
+      arr[j * 3 + 2] = st.joints[j].pos.z;
+    }
+    st.line.geometry.attributes.position.needsUpdate = true;
+    st.line.material.color.copy(col);
+  }
+}
+
+setup().catch(err => { statusEl.textContent = 'Camera or tracking failed: ' + err.message; });
+</script>
+</body>
+</html>
