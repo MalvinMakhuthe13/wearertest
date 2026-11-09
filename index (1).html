@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Wig Try-On Prototype</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: system-ui, sans-serif; }
+  #stage { position: fixed; inset: 0; overflow: hidden; }
+  video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+  canvas { position: absolute; transform: scaleX(-1); }
+  #status { position: absolute; top: 10px; left: 10px; right: 10px; color: #fff; background: rgba(0,0,0,.6); padding: 8px 12px; border-radius: 8px; font-size: 14px; z-index: 5; }
+  #panel { position: absolute; left: 0; right: 0; bottom: 0; z-index: 5; padding-bottom: env(safe-area-inset-bottom, 0px); }
+  #toggle { display: block; margin: 0 auto 6px; padding: 6px 16px; border: 0; border-radius: 16px; background: rgba(0,0,0,.65); color: #fff; font-size: 13px; }
+  #ui { background: rgba(0,0,0,.65); color: #fff; display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px 14px; padding: 10px 12px 14px; }
+  #ui.hidden { display: none; }
+  #ui label { font-size: 12px; display: flex; flex-direction: column; gap: 2px; }
+  #ui input { width: 100%; margin: 0; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="gl"></canvas>
+  <div id="status">Loading face tracking...</div>
+  <div id="panel">
+    <button id="toggle">Hide controls</button>
+    <div id="ui">
+      <label>Wig size <input type="range" id="size" min="0.7" max="1.5" step="0.02" value="1"></label>
+      <label>Wig height <input type="range" id="height" min="-4" max="4" step="0.25" value="0"></label>
+      <label>Hair length <input type="range" id="length" min="0.5" max="3" step="0.05" value="1.6"></label>
+      <label>Sway <input type="range" id="sway" min="0.05" max="0.6" step="0.01" value="0.25"></label>
+      <label>Colour <input type="color" id="colour" value="#1a1210"></label>
+    </div>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"
+} }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
+
+const stage = document.getElementById('stage');
+const video = document.getElementById('video');
+const canvas = document.getElementById('gl');
+const statusEl = document.getElementById('status');
+const ui = document.getElementById('ui');
+const toggle = document.getElementById('toggle');
+const colourEl = document.getElementById('colour');
+const lengthEl = document.getElementById('length');
+const swayEl = document.getElementById('sway');
+const sizeEl = document.getElementById('size');
+const heightEl = document.getElementById('height');
+
+toggle.addEventListener('click', () => {
+  ui.classList.toggle('hidden');
+  toggle.textContent = ui.classList.contains('hidden') ? 'Show controls' : 'Hide controls';
+});
+
+// ---------- Three.js scene (1 unit = 1 cm) ----------
+const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+// MediaPipe's face pose assumes a camera with a 63 degree vertical field of view
+const camera = new THREE.PerspectiveCamera(63, 9 / 16, 1, 2000);
+scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+const key = new THREE.DirectionalLight(0xffffff, 0.8);
+key.position.set(0.5, 1, 1);
+scene.add(key);
+
+// Face space: origin near eye level, +y up, +z toward the camera
+const RIM_Y = 6.5;                                   // where the wig edge sits, cm above eye level
+const DOME = { rx: 8.3, ry: 6.0, rz: 10.0, cz: -3.5 };
+
+// ---------- Wig (moves and scales with the head) ----------
+const wig = new THREE.Group();
+scene.add(wig);
+const capMat = new THREE.MeshStandardMaterial({ color: 0x1a1210, roughness: 0.8 });
+const cap = new THREE.Mesh(new THREE.SphereGeometry(1, 40, 20, 0, Math.PI * 2, 0, Math.PI / 2), capMat);
+cap.scale.set(DOME.rx, DOME.ry, DOME.rz);
+cap.position.set(0, RIM_Y, DOME.cz);
+wig.add(cap);
+
+// ---------- Invisible head and neck: hide hair that falls behind them ----------
+const headGroup = new THREE.Group();
+scene.add(headGroup);
+const occMat = new THREE.MeshBasicMaterial({ colorWrite: false });
+const occHead = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 24), occMat);
+occHead.scale.set(7.2, 10, 9.5);
+occHead.position.set(0, 1, -3.5);
+occHead.renderOrder = -1;
+const occNeck = new THREE.Mesh(new THREE.CylinderGeometry(5, 5, 14, 20), occMat);
+occNeck.position.set(0, -9, -4);
+occNeck.renderOrder = -1;
+headGroup.add(occHead, occNeck);
+
+// ---------- Hair strands: start on the sides and back, never across the face ----------
+const STRANDS = 140;
+const JOINTS = 9;
+const strands = [];
+for (let i = 0; i < STRANDS; i++) {
+  const angle = 1.5 * Math.PI + (i / (STRANDS - 1) - 0.5) * 1.44 * Math.PI;
+  const root = new THREE.Vector3(
+    Math.cos(angle) * DOME.rx,
+    RIM_Y - Math.random() * 0.8,
+    DOME.cz + Math.sin(angle) * DOME.rz
+  );
+  const joints = [];
+  for (let j = 0; j < JOINTS; j++) joints.push({ pos: new THREE.Vector3(), vel: new THREE.Vector3() });
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(JOINTS * 3), 3));
+  const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0x1a1210 }));
+  line.frustumCulled = false;
+  scene.add(line);
+  strands.push({ root, joints, line, ready: false });
+}
+
+// ---------- Layout: make the 3D canvas line up exactly with the cropped video ----------
+function layout() {
+  const W = stage.clientWidth, H = stage.clientHeight;
+  const vw = video.videoWidth || 720, vh = video.videoHeight || 1280;
+  const s = Math.max(W / vw, H / vh);
+  const dw = vw * s, dh = vh * s;
+  canvas.style.width = dw + 'px';
+  canvas.style.height = dh + 'px';
+  canvas.style.left = ((W - dw) / 2) + 'px';
+  canvas.style.top = ((H - dh) / 2) + 'px';
+  renderer.setSize(dw, dh, false);
+  camera.aspect = vw / vh;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', layout);
+video.addEventListener('loadedmetadata', layout);
+layout();
+
+// ---------- Face tracking ----------
+let landmarker;
+async function setup() {
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 1280, height: 720 }, audio: false });
+  video.srcObject = stream;
+  await video.play();
+  layout();
+
+  const fileset = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+  const make = delegate => FaceLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task', delegate },
+    runningMode: 'VIDEO', numFaces: 1, outputFacialTransformationMatrixes: true
+  });
+  try { landmarker = await make('GPU'); } catch (e) { landmarker = await make('CPU'); }
+  statusEl.textContent = 'Look at the camera';
+  requestAnimationFrame(loop);
+}
+
+// ---------- Main loop ----------
+const headMatrix = new THREE.Matrix4();
+const headPos = new THREE.Vector3();
+const headQuat = new THREE.Quaternion();
+const headScale = new THREE.Vector3();
+const tmp = new THREE.Vector3();
+let lastTime = performance.now();
+let lastVideoTime = -1;
+let faceFound = false;
+
+function loop(now) {
+  requestAnimationFrame(loop);
+  const dt = Math.min((now - lastTime) / 1000, 0.05);
+  lastTime = now;
+
+  if (video.currentTime !== lastVideoTime && video.readyState >= 2) {
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, now);
+    if (res.facialTransformationMatrixes && res.facialTransformationMatrixes.length) {
+      headMatrix.fromArray(res.facialTransformationMatrixes[0].data);
+      headMatrix.decompose(headPos, headQuat, headScale);   // position is in cm
+      wig.position.copy(headPos);
+      wig.quaternion.copy(headQuat);
+      wig.scale.setScalar(parseFloat(sizeEl.value));
+      headGroup.position.copy(headPos);
+      headGroup.quaternion.copy(headQuat);
+      faceFound = true;
+      statusEl.style.display = 'none';
+    } else {
+      faceFound = false;
+      statusEl.style.display = 'block';
+      statusEl.textContent = 'No face found. Find good light and face the camera.';
+    }
+  }
+  wig.visible = faceFound;
+  headGroup.visible = faceFound;
+  cap.position.y = RIM_Y + parseFloat(heightEl.value);
+  updateHair(dt);
+  renderer.render(scene, camera);
+}
+
+// ---------- Hair physics: chained springs that lag behind the head ----------
+const gravity = new THREE.Vector3(0, -80, 0);
+const rootWorld = new THREE.Vector3();
+function updateHair(dt) {
+  const totalLen = parseFloat(lengthEl.value) * 15;       // cm
+  const stiffness = 1 - parseFloat(swayEl.value);
+  const segLen = totalLen / (JOINTS - 1);
+  const offset = parseFloat(heightEl.value);
+  const col = new THREE.Color(colourEl.value);
+  capMat.color.copy(col);
+
+  for (const st of strands) {
+    st.line.visible = faceFound;
+    if (!faceFound) { st.ready = false; continue; }
+
+    rootWorld.copy(st.root);
+    rootWorld.y += offset;
+    rootWorld.multiplyScalar(wig.scale.x).applyQuaternion(wig.quaternion).add(wig.position);
+
+    // first frame after the face appears: hang the strand straight down from its root
+    if (!st.ready) {
+      for (let j = 0; j < JOINTS; j++) {
+        st.joints[j].pos.copy(rootWorld);
+        st.joints[j].pos.y -= j * segLen;
+        st.joints[j].vel.set(0, 0, 0);
+      }
+      st.ready = true;
+    }
+
+    st.joints[0].pos.copy(rootWorld);
+    st.joints[0].vel.set(0, 0, 0);
+
+    for (let j = 1; j < JOINTS; j++) {
+      const p = st.joints[j], prev = st.joints[j - 1];
+      p.vel.addScaledVector(gravity, dt);
+      p.vel.multiplyScalar(0.92);
+      p.pos.addScaledVector(p.vel, dt);
+
+      tmp.copy(p.pos).sub(prev.pos);
+      const dist = tmp.length() || 0.0001;
+      tmp.multiplyScalar(segLen / dist).add(prev.pos);
+      p.pos.lerp(tmp, 0.5 + stiffness * 0.5);
+    }
+
+    const arr = st.line.geometry.attributes.position.array;
+    for (let j = 0; j < JOINTS; j++) {
+      arr[j * 3] = st.joints[j].pos.x;
+      arr[j * 3 + 1] = st.joints[j].pos.y;
+      arr[j * 3 + 2] = st.joints[j].pos.z;
+    }
+    st.line.geometry.attributes.position.needsUpdate = true;
+    st.line.material.color.copy(col);
+  }
+}
+
+setup().catch(err => { statusEl.textContent = 'Camera or tracking failed: ' + err.message; });
+</script>
+</body>
+</html>
